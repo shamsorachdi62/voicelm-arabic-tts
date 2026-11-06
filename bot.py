@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 VoiceLM Arabic TTS Telegram Bot:
-Concise, minimal, zero emojis.
+Ultra-minimal, zero stats, zero emojis, purely functional.
 """
 
 import os
@@ -29,13 +29,12 @@ def make_keyboard():
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = []
     for spk_id, info in SPEAKERS_INFO.items():
-        text = f"{info['desc']} ({spk_id})"
-        buttons.append(types.InlineKeyboardButton(text, callback_data=f"spk_{spk_id}"))
+        buttons.append(types.InlineKeyboardButton(f"{info['desc']} ({spk_id})", callback_data=f"spk_{spk_id}"))
     markup.add(*buttons)
     return markup
 
 def create_bot(token):
-    bot = telebot.TeleBot(token, parse_mode="Markdown")
+    bot = telebot.TeleBot(token, parse_mode=None)
 
     @bot.message_handler(commands=['start', 'help'])
     def handle_start(message):
@@ -43,10 +42,7 @@ def create_bot(token):
 
     @bot.message_handler(commands=['voice'])
     def handle_voice_cmd(message):
-        current_spk = user_speakers.get(message.chat.id, 'star04')
-        desc = SPEAKERS_INFO.get(current_spk, {}).get('desc', '')
-        msg = f"اختر الصوت (الحالي: {desc} - {current_spk}):"
-        bot.send_message(message.chat.id, msg, reply_markup=make_keyboard())
+        bot.send_message(message.chat.id, "اختر الصوت:", reply_markup=make_keyboard())
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith('spk_'))
     def handle_voice_callback(call):
@@ -56,7 +52,7 @@ def create_bot(token):
             info = SPEAKERS_INFO[spk_id]
             bot.answer_callback_query(call.id, f"تم اختيار {info['desc']}")
             bot.edit_message_text(
-                f"تم ضبط الصوت: {info['desc']} ({spk_id})",
+                f"تم اختيار {info['desc']}.",
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id
             )
@@ -71,32 +67,29 @@ def create_bot(token):
         spk_id = user_speakers.get(chat_id, 'star04')
         print(f"[Bot] Synthesizing for {chat_id}: '{text[:30]}...' ({spk_id})", flush=True)
         
-        status_msg = bot.reply_to(message, "جاري التوليد...")
-        
         try:
-            t0 = time.time()
+            bot.send_chat_action(chat_id, 'record_voice')
+        except Exception:
+            pass
+            
+        try:
             eng = get_engine()
             temp_wav = f"voice_{chat_id}_{int(time.time()*1000)}.wav"
-            waveform = eng.synthesize(text, speaker=spk_id, out_wav=temp_wav)
-            elapsed = time.time() - t0
-            duration_s = len(waveform) / 24000.0
-            
-            caption = f"الصوت: {spk_id} | التوليد: {elapsed:.1f} ثانية | المدة: {duration_s:.1f} ثانية"
+            eng.synthesize(text, speaker=spk_id, out_wav=temp_wav)
             
             with open(temp_wav, "rb") as audio:
                 try:
-                    bot.send_voice(chat_id, audio, caption=caption, reply_to_message_id=message.message_id)
+                    bot.send_voice(chat_id, audio, reply_to_message_id=message.message_id)
                 except Exception:
                     audio.seek(0)
-                    bot.send_audio(chat_id, audio, caption=caption, reply_to_message_id=message.message_id)
+                    bot.send_audio(chat_id, audio, reply_to_message_id=message.message_id)
                     
             if os.path.exists(temp_wav):
                 os.remove(temp_wav)
-            bot.delete_message(chat_id, status_msg.message_id)
-            print(f"[Bot] Sent to {chat_id} in {elapsed:.2f}s", flush=True)
+            print(f"[Bot] Sent voice to {chat_id}", flush=True)
         except Exception as e:
             print(f"[Bot] Error: {e}", flush=True)
-            bot.edit_message_text(f"خطأ: {str(e)}", chat_id=chat_id, message_id=status_msg.message_id)
+            bot.reply_to(message, f"خطأ: {str(e)}")
 
     return bot
 
