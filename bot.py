@@ -60,10 +60,10 @@ def get_engine():
     return engine
 
 def make_voice_keyboard():
-    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup = types.InlineKeyboardMarkup(row_width=4)
     buttons = []
-    for spk_id, info in SPEAKERS_INFO.items():
-        buttons.append(types.InlineKeyboardButton(f"{info['desc']} ({spk_id})", callback_data=f"spk_{spk_id}"))
+    for spk_id in sorted(SPEAKERS_INFO.keys()):
+        buttons.append(types.InlineKeyboardButton(spk_id, callback_data=f"spk_{spk_id}"))
     markup.add(*buttons)
     return markup
 
@@ -172,9 +172,8 @@ def create_bot(token):
         cfg = get_config(message.chat.id)
         loc = cfg['locale'] if cfg['locale'] else "تلقائي"
         spk = cfg['speaker']
-        desc = SPEAKERS_INFO.get(spk, {}).get('desc', spk)
         msg = (
-            f"الصوت: {desc} ({spk})\n"
+            f"الصوت: {spk}\n"
             f"اللغة: {loc}\n"
             f"السرعة: {cfg['speed']:.2f}x\n"
             f"الحدة: {cfg['pitch']:+.1f}\n"
@@ -193,9 +192,8 @@ def create_bot(token):
         spk_id = call.data.replace('spk_', '')
         if spk_id in SPEAKERS_INFO:
             set_config(call.message.chat.id, 'speaker', spk_id)
-            info = SPEAKERS_INFO[spk_id]
-            bot.answer_callback_query(call.id, f"تم اختيار {info['desc']}")
-            bot.edit_message_text(f"تم اختيار {info['desc']}.", chat_id=call.message.chat.id, message_id=call.message.message_id)
+            bot.answer_callback_query(call.id, f"تم اختيار {spk_id}")
+            bot.edit_message_text(f"تم اختيار: {spk_id}.", chat_id=call.message.chat.id, message_id=call.message.message_id)
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith('lng_'))
     def handle_lang_callback(call):
