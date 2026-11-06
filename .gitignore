@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+*.wav
+temp_*.wav
+.ipynb_checkpoints/
+.DS_Store

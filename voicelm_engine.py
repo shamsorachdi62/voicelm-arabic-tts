@@ -1,0 +1,299 @@
+import os
+import sys
+import re
+import numpy as np
+import scipy.io.wavfile as wavfile
+
+# Cross-platform TFLite interpreter loader
+def get_interpreter(model_path):
+    try:
+        from ai_edge_litert.interpreter import Interpreter
+        return Interpreter(model_path=model_path)
+    except ImportError:
+        pass
+    try:
+        from tflite_runtime.interpreter import Interpreter
+        return Interpreter(model_path=model_path)
+    except ImportError:
+        pass
+    try:
+        import tensorflow as tf
+        return tf.lite.Interpreter(model_path=model_path)
+    except ImportError:
+        raise ImportError(
+            "Could not find any TFLite runtime. Please install one of:\n"
+            "  pip install ai-edge-litert\n"
+            "or\n"
+            "  pip install tflite-runtime\n"
+            "or\n"
+            "  pip install tensorflow"
+        )
+
+# Mapping constants reverse-engineered from speech::tts::SplitTfliteVoiceLmInferenceRunner
+ENC_CA_MAP = {
+    0: (24, 6), 1: (10, 16), 2: (11, 18), 3: (5, 2), 4: (1, 8), 5: (25, 7),
+    6: (13, 3), 7: (0, 14), 8: (4, 17), 9: (9, 12), 10: (23, 20), 11: (22, 21),
+}
+TEMP_CA_IN = {
+    0: (45, 14), 1: (23, 34), 2: (24, 36), 3: (13, 5), 4: (3, 16), 5: (46, 15),
+    6: (27, 7), 7: (2, 30), 8: (12, 35), 9: (22, 25), 10: (44, 38), 11: (42, 39),
+}
+TEMP_SA_CYCLE = {
+    0: (37, 16, 9, 3), 1: (40, 17, 48, 21), 2: (29, 13, 20, 8), 3: (11, 5, 51, 24),
+    4: (43, 19, 18, 6), 5: (49, 22, 41, 18), 6: (31, 14, 21, 9), 7: (47, 20, 26, 10),
+    8: (19, 7, 0, 0), 9: (4, 1, 28, 12), 10: (8, 2, 32, 15), 11: (50, 23, 10, 4),
+}
+SOUNDSTREAM_STATE_MAPPING = {
+    237: 1, 236: 2, 134: 3, 141: 4, 148: 5, 155: 6, 163: 7, 170: 8,
+    177: 9, 184: 10, 191: 11, 198: 12, 206: 13, 213: 14, 220: 15, 227: 16, 235: 17
+}
+
+SPEAKERS_INFO = {
+    'star02': {'gender': 'female', 'desc': 'أنثوي فصيح وواضح'},
+    'star04': {'gender': 'male',   'desc': 'ذكوري إذاعي وقور'},
+    'star05': {'gender': 'male',   'desc': 'ذكوري هادئ ومعاصر'},
+    'star08': {'gender': 'female', 'desc': 'أنثوي دافئ'},
+    'star11': {'gender': 'male',   'desc': 'ذكوري شاب وحيوي'},
+    'star12': {'gender': 'female', 'desc': 'أنثوي رزين'},
+    'star13': {'gender': 'male',   'desc': 'ذكوري قوي'},
+    'star16': {'gender': 'female', 'desc': 'أنثوي تعبيري'},
+}
+
+class VoiceLMTTS:
+    def __init__(self, models_dir=None):
+        if models_dir is None:
+            models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+        self.models_dir = models_dir
+        self.prompts_dir = os.path.join(models_dir, "prompts")
+        
+        print(f"[VoiceLM] Initializing models from {self.models_dir}...")
+        self.prep = get_interpreter(os.path.join(models_dir, "voicelm_preprocessing.tflite"))
+        self.prep.allocate_tensors()
+        
+        self.enc = get_interpreter(os.path.join(models_dir, "voicelm_encoder.tflite"))
+        self.enc.allocate_tensors()
+        
+        self.temp = get_interpreter(os.path.join(models_dir, "voicelm_temporal_decoder.tflite"))
+        self.temp.allocate_tensors()
+        
+        self.depth = get_interpreter(os.path.join(models_dir, "voicelm_merged_depth_decoder.tflite"))
+        self.depth.allocate_tensors()
+        
+        self.quant = get_interpreter(os.path.join(models_dir, "soundstream_quantizer.tflite"))
+        self.quant.allocate_tensors()
+        
+        self.dec = get_interpreter(os.path.join(models_dir, "soundstream_decoder.tflite"))
+        self.dec.allocate_tensors()
+        
+        # Load official iSTFT window
+        win_path = os.path.join(models_dir, "istft_window_truediv.npy")
+        self.istft_window = np.load(win_path)
+        
+        # Cache speaker prompt tensors
+        self.prompts = {}
+        for spk in SPEAKERS_INFO:
+            p_path = os.path.join(self.prompts_dir, f"ar_xa_{spk}_prompt.npy")
+            if os.path.exists(p_path):
+                self.prompts[spk] = np.load(p_path)
+        print(f"[VoiceLM] Loaded {len(self.prompts)} speaker prompts successfully.")
+
+    def normalize_text(self, text):
+        """Remove Quranic annotation marks that cause ByT5 byte misinterpretation."""
+        text = re.sub(r'[\u0670]', '', text)       # Dagger alif -> canonical MSA spelling
+        text = re.sub(r'[\u06D6-\u06ED]', '', text) # Recitation marks
+        return text.strip()
+
+    def _stream_istft(self, stft_frames):
+        """Official streaming iSTFT and OverlapAdd (hop=240, frame=480)."""
+        num_frames = stft_frames.shape[0]
+        out_samples = []
+        state = np.zeros(480, dtype=np.float32)
+        for i in range(num_frames):
+            spec_240 = stft_frames[i]
+            spec_241 = np.pad(spec_240, ((0, 1), (0, 0)), mode='constant')
+            c_spec = spec_241[:, 0] + 1j * spec_241[:, 1]
+            time_frame = np.fft.irfft(c_spec, n=480).astype(np.float32)
+            win_frame = time_frame * self.istft_window
+            state += win_frame
+            out_samples.append(state[:240].copy())
+            state[:240] = state[240:]
+            state[240:] = 0.0
+        out_samples.append(state[:240].copy())
+        return np.concatenate(out_samples)
+
+    def _synthesize_chunk(self, chunk_text, speaker='star04', max_frames=80, cf_guidance=2.2, temperature=0.4):
+        if speaker not in self.prompts:
+            speaker = 'star04'
+        prompt_floats = self.prompts[speaker]
+        
+        chunk_text = self.normalize_text(chunk_text)
+        text_bytes = list(chunk_text.encode('utf-8'))
+        t_len = min(len(text_bytes), 256)
+        
+        text_array = np.zeros((1, 256), dtype=np.int32)
+        text_array[0, :t_len] = text_bytes[:t_len]
+        text_size = np.array([t_len], dtype=np.int32)
+        
+        prompt_array = np.zeros((1, 128, 128), dtype=np.float32)
+        p_len = min(prompt_floats.shape[1], 128)
+        prompt_array[0, :p_len, :] = prompt_floats[0, :p_len, :]
+        prompt_size = np.array([p_len], dtype=np.int32)
+        
+        audio_ctx = np.zeros((1, 128, 128), dtype=np.float32)
+        audio_ctx_size = np.array([0], dtype=np.int32)
+        
+        # 1. Preprocessing
+        self.prep.set_tensor(3, text_array)
+        self.prep.set_tensor(4, text_size)
+        self.prep.set_tensor(0, prompt_array)
+        self.prep.set_tensor(5, prompt_size)
+        self.prep.set_tensor(1, audio_ctx)
+        self.prep.set_tensor(2, audio_ctx_size)
+        self.prep.invoke()
+        
+        # 2. Encoder
+        self.enc.set_tensor(0, self.prep.get_tensor(48))
+        self.enc.set_tensor(1, self.prep.get_tensor(0))
+        self.enc.set_tensor(2, self.prep.get_tensor(1))
+        self.enc.set_tensor(3, self.prep.get_tensor(52))
+        self.enc.set_tensor(4, self.prep.get_tensor(46))
+        self.enc.set_tensor(5, self.prep.get_tensor(56))
+        self.enc.invoke()
+        
+        enc_outs = self.enc.get_output_details()
+        enc_paddings = self.enc.get_tensor(enc_outs[15]['index'])
+        target_emb = self.enc.get_tensor(enc_outs[19]['index'])
+        
+        # 3. Bind Cross-Attention
+        self.temp.set_tensor(33, enc_paddings)
+        for layer in range(12):
+            k_out_idx, v_out_idx = ENC_CA_MAP[layer]
+            k_in_idx, v_in_idx = TEMP_CA_IN[layer]
+            self.temp.set_tensor(k_in_idx, self.enc.get_tensor(enc_outs[k_out_idx]['index']))
+            self.temp.set_tensor(v_in_idx, self.enc.get_tensor(enc_outs[v_out_idx]['index']))
+            
+        sa_cache = {}
+        for layer in range(12):
+            sa_cache[(layer, 'key')] = np.zeros((2, 193, 128), dtype=np.float32)
+            sa_cache[(layer, 'value')] = np.zeros((2, 193, 128), dtype=np.float32)
+            
+        dec_inputs = self.dec.get_input_details()
+        dec_state = {inp['index']: np.zeros(inp['shape'], dtype=inp['dtype']) for inp in dec_inputs if inp['name'] != 'input_audio'}
+        audio_inp_idx = [i['index'] for i in dec_inputs if i['name'] == 'input_audio'][0]
+        
+        quant_inps = self.quant.get_input_details()
+        quant_outs = self.quant.get_output_details()
+        temp_outs = self.temp.get_output_details()
+        depth_outs = self.depth.get_output_details()
+        
+        stft_frames_list = []
+        
+        for t in range(max_frames):
+            mask = np.full((1, 1, 193), -3.4028235e+38, dtype=np.float32)
+            mask[0, 0, :t+1] = 0.0
+            
+            self.temp.set_tensor(1, np.array(t, dtype=np.int32))
+            self.temp.set_tensor(6, target_emb)
+            self.temp.set_tensor(17, mask)
+            
+            for layer in range(12):
+                k_in, _, v_in, _ = TEMP_SA_CYCLE[layer]
+                self.temp.set_tensor(k_in, sa_cache[(layer, 'key')])
+                self.temp.set_tensor(v_in, sa_cache[(layer, 'value')])
+                
+            self.temp.invoke()
+            
+            for layer in range(12):
+                _, k_out, _, v_out = TEMP_SA_CYCLE[layer]
+                sa_cache[(layer, 'key')] = self.temp.get_tensor(temp_outs[k_out]['index'])
+                sa_cache[(layer, 'value')] = self.temp.get_tensor(temp_outs[v_out]['index'])
+                
+            temporal_output = self.temp.get_tensor(temp_outs[11]['index'])
+            
+            u = np.random.uniform(1e-6, 1.0 - 1e-6, size=(1, 18, 40)).astype(np.float32)
+            noise = -np.log(-np.log(u))
+            
+            self.depth.set_tensor(0, np.array([cf_guidance], dtype=np.float32))
+            self.depth.set_tensor(1, temporal_output)
+            self.depth.set_tensor(2, noise)
+            self.depth.set_tensor(3, np.array([temperature], dtype=np.float32))
+            self.depth.invoke()
+            
+            ss_tokens = self.depth.get_tensor(depth_outs[0]['index'])
+            target_emb = self.depth.get_tensor(depth_outs[1]['index'])
+            new_ids = self.depth.get_tensor(depth_outs[2]['index'])
+            
+            if new_ids < 2:
+                break
+                
+            self.quant.set_tensor(quant_inps[0]['index'], ss_tokens.reshape(1, 18))
+            self.quant.invoke()
+            audio_emb_128 = self.quant.get_tensor(quant_outs[0]['index'])
+            
+            self.dec.set_tensor(audio_inp_idx, audio_emb_128.reshape(1, 1, 128))
+            for in_idx, s_val in dec_state.items():
+                self.dec.set_tensor(in_idx, s_val)
+            self.dec.invoke()
+            
+            stft_chunk = self.dec.get_tensor(234)
+            for step in range(10):
+                stft_frames_list.append(stft_chunk[0, step])
+                
+            for out_idx, in_idx in SOUNDSTREAM_STATE_MAPPING.items():
+                dec_state[in_idx] = self.dec.get_tensor(out_idx)
+                
+        if len(stft_frames_list) == 0:
+            return np.zeros(2400, dtype=np.float32)
+            
+        stft_all = np.array(stft_frames_list)
+        return self._stream_istft(stft_all)
+
+    def split_into_chunks(self, text, max_bytes=220):
+        """Splits long texts into natural sentence chunks under max_bytes."""
+        text = self.normalize_text(text)
+        if len(text.encode('utf-8')) <= max_bytes:
+            return [text]
+            
+        delimiters = r'([.،؛؟!\n]+)'
+        parts = re.split(delimiters, text)
+        chunks = []
+        current = ""
+        
+        for part in parts:
+            if not part:
+                continue
+            test = (current + part).strip()
+            if len(test.encode('utf-8')) <= max_bytes:
+                current += part
+            else:
+                if current.strip():
+                    chunks.append(current.strip())
+                current = part
+                
+        if current.strip():
+            chunks.append(current.strip())
+        return chunks if chunks else [text]
+
+    def synthesize(self, text, speaker='star04', out_wav=None, cf_guidance=2.2, temperature=0.4):
+        """
+        Synthesizes any Arabic text (short or long), concatenating chunks smoothly.
+        Returns the generated audio waveform (float32, 24 kHz) and saves to out_wav if given.
+        """
+        chunks = self.split_into_chunks(text)
+        waveforms = []
+        silence = np.zeros(int(24000 * 0.15), dtype=np.float32) # 150ms pause between sentences
+        
+        for idx, chunk in enumerate(chunks):
+            w = self._synthesize_chunk(chunk, speaker=speaker, cf_guidance=cf_guidance, temperature=temperature)
+            waveforms.append(w)
+            if idx < len(chunks) - 1:
+                waveforms.append(silence)
+                
+        waveform = np.concatenate(waveforms)
+        max_val = np.abs(waveform).max()
+        if max_val > 1e-4:
+            waveform = waveform / max_val * 0.95
+            
+        if out_wav:
+            wavfile.write(out_wav, 24000, (waveform * 32767).astype(np.int16))
+        return waveform
