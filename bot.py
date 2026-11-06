@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-VoiceLM Arabic TTS Telegram Bot:
+VoiceLM Multilingual TTS Telegram Bot:
 Ultra-minimal, zero stats, zero emojis, purely functional.
+Supports 52 languages and 416 speaker voices.
 """
 
 import os
@@ -14,8 +15,24 @@ from voicelm_engine import VoiceLMTTS, SPEAKERS_INFO
 
 DEFAULT_TOKEN = os.environ.get("BOT_TOKEN", "9256956395:AAGYTGF2vYVMzGafGzKsDLseZh2JLEpfZyM")
 
+POPULAR_LOCALES = {
+    'auto': 'تلقائي',
+    'ar_xa': 'العربية',
+    'en_us': 'الإنجليزية',
+    'fr_fr': 'الفرنسية',
+    'es_es': 'الإسبانية',
+    'de_de': 'الألمانية',
+    'ru_ru': 'الروسية',
+    'tr_tr': 'التركية',
+    'it_it': 'الإيطالية',
+    'ja_jp': 'اليابانية',
+    'cmn_cn': 'الصينية',
+    'ko_kr': 'الكورية',
+}
+
 engine = None
-user_speakers = {} # chat_id -> speaker_id
+user_speakers = {}  # chat_id -> speaker_id
+user_locales = {}   # chat_id -> locale_code (or None for auto)
 
 def get_engine():
     global engine
@@ -25,11 +42,19 @@ def get_engine():
         print("[VoiceLM] Models ready.", flush=True)
     return engine
 
-def make_keyboard():
+def make_voice_keyboard():
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = []
     for spk_id, info in SPEAKERS_INFO.items():
         buttons.append(types.InlineKeyboardButton(f"{info['desc']} ({spk_id})", callback_data=f"spk_{spk_id}"))
+    markup.add(*buttons)
+    return markup
+
+def make_lang_keyboard():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    buttons = []
+    for code, name in POPULAR_LOCALES.items():
+        buttons.append(types.InlineKeyboardButton(name, callback_data=f"lng_{code}"))
     markup.add(*buttons)
     return markup
 
@@ -38,11 +63,15 @@ def create_bot(token):
 
     @bot.message_handler(commands=['start', 'help'])
     def handle_start(message):
-        bot.reply_to(message, "أرسل النص لتحويله إلى صوت، أو /voice لاختيار الصوت.")
+        bot.reply_to(message, "أرسل النص لتحويله إلى صوت، أو /voice لاختيار الصوت، أو /lang لاختيار اللغة.")
 
     @bot.message_handler(commands=['voice'])
     def handle_voice_cmd(message):
-        bot.send_message(message.chat.id, "اختر الصوت:", reply_markup=make_keyboard())
+        bot.send_message(message.chat.id, "اختر الصوت:", reply_markup=make_voice_keyboard())
+
+    @bot.message_handler(commands=['lang'])
+    def handle_lang_cmd(message):
+        bot.send_message(message.chat.id, "اختر اللغة:", reply_markup=make_lang_keyboard())
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith('spk_'))
     def handle_voice_callback(call):
@@ -57,6 +86,19 @@ def create_bot(token):
                 message_id=call.message.message_id
             )
 
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('lng_'))
+    def handle_lang_callback(call):
+        code = call.data.replace('lng_', '')
+        if code in POPULAR_LOCALES:
+            user_locales[call.message.chat.id] = None if code == 'auto' else code
+            name = POPULAR_LOCALES[code]
+            bot.answer_callback_query(call.id, f"تم اختيار {name}")
+            bot.edit_message_text(
+                f"تم اختيار {name}.",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id
+            )
+
     @bot.message_handler(func=lambda message: True)
     def handle_text_message(message):
         text = message.text.strip()
@@ -65,7 +107,8 @@ def create_bot(token):
 
         chat_id = message.chat.id
         spk_id = user_speakers.get(chat_id, 'star04')
-        print(f"[Bot] Synthesizing for {chat_id}: '{text[:30]}...' ({spk_id})", flush=True)
+        loc = user_locales.get(chat_id, None)
+        print(f"[Bot] Synthesizing for {chat_id}: '{text[:30]}...' ({spk_id}, loc={loc})", flush=True)
         
         try:
             bot.send_chat_action(chat_id, 'record_voice')
@@ -75,7 +118,7 @@ def create_bot(token):
         try:
             eng = get_engine()
             temp_wav = f"voice_{chat_id}_{int(time.time()*1000)}.wav"
-            eng.synthesize(text, speaker=spk_id, out_wav=temp_wav)
+            eng.synthesize(text, locale=loc, speaker=spk_id, out_wav=temp_wav)
             
             with open(temp_wav, "rb") as audio:
                 try:
