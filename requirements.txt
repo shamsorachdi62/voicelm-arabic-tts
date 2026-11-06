@@ -1,4 +1,4 @@
 ai-edge-litert>=1.0.0
 numpy>=1.22.0
 scipy>=1.9.0
-python-telegram-bot>=20.0
+pyTelegramBotAPI>=4.14.0
