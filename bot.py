@@ -2,7 +2,7 @@
 """
 VoiceLM Multilingual TTS Telegram Bot:
 Ultra-minimal, zero stats, zero emojis, purely functional.
-Supports 52 languages and 416 speaker voices.
+Supports full parameter control: speed, pitch, guidance, temperature, locale, speaker.
 """
 
 import os
@@ -31,8 +31,25 @@ POPULAR_LOCALES = {
 }
 
 engine = None
-user_speakers = {}  # chat_id -> speaker_id
-user_locales = {}   # chat_id -> locale_code (or None for auto)
+user_params = {}  # chat_id -> dict
+
+DEFAULT_CONFIG = {
+    'speaker': 'star04',
+    'locale': None,
+    'speed': 1.0,
+    'pitch': 0.0,
+    'cf_guidance': 2.2,
+    'temperature': 0.4,
+}
+
+def get_config(chat_id):
+    if chat_id not in user_params:
+        user_params[chat_id] = DEFAULT_CONFIG.copy()
+    return user_params[chat_id]
+
+def set_config(chat_id, key, val):
+    cfg = get_config(chat_id)
+    cfg[key] = val
 
 def get_engine():
     global engine
@@ -58,12 +75,33 @@ def make_lang_keyboard():
     markup.add(*buttons)
     return markup
 
+def make_speed_keyboard():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    buttons = [
+        types.InlineKeyboardButton("0.75x (بطيء)", callback_data="spd_0.75"),
+        types.InlineKeyboardButton("1.0x (طبيعي)", callback_data="spd_1.0"),
+        types.InlineKeyboardButton("1.25x (سريع)", callback_data="spd_1.25"),
+        types.InlineKeyboardButton("1.5x (أسرع)", callback_data="spd_1.5"),
+    ]
+    markup.add(*buttons)
+    return markup
+
+def make_pitch_keyboard():
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    buttons = [
+        types.InlineKeyboardButton("-3 (أغلظ)", callback_data="ptc_-3"),
+        types.InlineKeyboardButton("0 (طبيعي)", callback_data="ptc_0"),
+        types.InlineKeyboardButton("+3 (أحدّ)", callback_data="ptc_3"),
+    ]
+    markup.add(*buttons)
+    return markup
+
 def create_bot(token):
     bot = telebot.TeleBot(token, parse_mode=None)
 
     @bot.message_handler(commands=['start', 'help'])
     def handle_start(message):
-        bot.reply_to(message, "أرسل النص لتحويله إلى صوت، أو /voice لاختيار الصوت، أو /lang لاختيار اللغة.")
+        bot.reply_to(message, "أرسل النص لتحويله إلى صوت مباشرة.\nالأوامر: /voice /lang /speed /pitch /guidance /temp /settings /reset")
 
     @bot.message_handler(commands=['voice'])
     def handle_voice_cmd(message):
@@ -73,31 +111,115 @@ def create_bot(token):
     def handle_lang_cmd(message):
         bot.send_message(message.chat.id, "اختر اللغة:", reply_markup=make_lang_keyboard())
 
+    @bot.message_handler(commands=['speed'])
+    def handle_speed_cmd(message):
+        parts = message.text.strip().split()
+        if len(parts) > 1:
+            try:
+                val = float(parts[1])
+                val = max(0.5, min(val, 2.0))
+                set_config(message.chat.id, 'speed', val)
+                bot.reply_to(message, f"تم ضبط السرعة: {val:.2f}x")
+                return
+            except ValueError:
+                pass
+        bot.send_message(message.chat.id, "اختر السرعة:", reply_markup=make_speed_keyboard())
+
+    @bot.message_handler(commands=['pitch'])
+    def handle_pitch_cmd(message):
+        parts = message.text.strip().split()
+        if len(parts) > 1:
+            try:
+                val = float(parts[1])
+                val = max(-6.0, min(val, 6.0))
+                set_config(message.chat.id, 'pitch', val)
+                bot.reply_to(message, f"تم ضبط الحدة: {val:+.1f}")
+                return
+            except ValueError:
+                pass
+        bot.send_message(message.chat.id, "اختر الحدة:", reply_markup=make_pitch_keyboard())
+
+    @bot.message_handler(commands=['guidance'])
+    def handle_guidance_cmd(message):
+        parts = message.text.strip().split()
+        if len(parts) > 1:
+            try:
+                val = float(parts[1])
+                val = max(1.0, min(val, 5.0))
+                set_config(message.chat.id, 'cf_guidance', val)
+                bot.reply_to(message, f"تم ضبط التوجيه: {val:.1f}")
+                return
+            except ValueError:
+                pass
+        bot.reply_to(message, "أرسل القيمة بعد الأمر من 1.0 إلى 5.0 (مثال: /guidance 2.5)")
+
+    @bot.message_handler(commands=['temp'])
+    def handle_temp_cmd(message):
+        parts = message.text.strip().split()
+        if len(parts) > 1:
+            try:
+                val = float(parts[1])
+                val = max(0.1, min(val, 1.0))
+                set_config(message.chat.id, 'temperature', val)
+                bot.reply_to(message, f"تم ضبط الحرارة: {val:.2f}")
+                return
+            except ValueError:
+                pass
+        bot.reply_to(message, "أرسل القيمة بعد الأمر من 0.1 إلى 1.0 (مثال: /temp 0.4)")
+
+    @bot.message_handler(commands=['settings'])
+    def handle_settings_cmd(message):
+        cfg = get_config(message.chat.id)
+        loc = cfg['locale'] if cfg['locale'] else "تلقائي"
+        spk = cfg['speaker']
+        desc = SPEAKERS_INFO.get(spk, {}).get('desc', spk)
+        msg = (
+            f"الصوت: {desc} ({spk})\n"
+            f"اللغة: {loc}\n"
+            f"السرعة: {cfg['speed']:.2f}x\n"
+            f"الحدة: {cfg['pitch']:+.1f}\n"
+            f"التوجيه: {cfg['cf_guidance']:.1f}\n"
+            f"الحرارة: {cfg['temperature']:.2f}"
+        )
+        bot.reply_to(message, msg)
+
+    @bot.message_handler(commands=['reset'])
+    def handle_reset_cmd(message):
+        user_params[message.chat.id] = DEFAULT_CONFIG.copy()
+        bot.reply_to(message, "تمت استعادة الإعدادات الافتراضية.")
+
     @bot.callback_query_handler(func=lambda call: call.data.startswith('spk_'))
     def handle_voice_callback(call):
         spk_id = call.data.replace('spk_', '')
         if spk_id in SPEAKERS_INFO:
-            user_speakers[call.message.chat.id] = spk_id
+            set_config(call.message.chat.id, 'speaker', spk_id)
             info = SPEAKERS_INFO[spk_id]
             bot.answer_callback_query(call.id, f"تم اختيار {info['desc']}")
-            bot.edit_message_text(
-                f"تم اختيار {info['desc']}.",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id
-            )
+            bot.edit_message_text(f"تم اختيار {info['desc']}.", chat_id=call.message.chat.id, message_id=call.message.message_id)
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith('lng_'))
     def handle_lang_callback(call):
         code = call.data.replace('lng_', '')
         if code in POPULAR_LOCALES:
-            user_locales[call.message.chat.id] = None if code == 'auto' else code
+            loc = None if code == 'auto' else code
+            set_config(call.message.chat.id, 'locale', loc)
             name = POPULAR_LOCALES[code]
             bot.answer_callback_query(call.id, f"تم اختيار {name}")
-            bot.edit_message_text(
-                f"تم اختيار {name}.",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id
-            )
+            bot.edit_message_text(f"تم اختيار {name}.", chat_id=call.message.chat.id, message_id=call.message.message_id)
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('spd_'))
+    def handle_speed_callback(call):
+        val = float(call.data.replace('spd_', ''))
+        set_config(call.message.chat.id, 'speed', val)
+        bot.answer_callback_query(call.id, f"السرعة: {val:.2f}x")
+        bot.edit_message_text(f"تم ضبط السرعة: {val:.2f}x.", chat_id=call.message.chat.id, message_id=call.message.message_id)
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('ptc_'))
+    def handle_pitch_callback(call):
+        val = float(call.data.replace('ptc_', ''))
+        set_config(call.message.chat.id, 'pitch', val)
+        bot.answer_callback_query(call.id, f"الحدة: {val:+.1f}")
+        bot.edit_message_text(f"تم ضبط الحدة: {val:+.1f}.", chat_id=call.message.chat.id, message_id=call.message.message_id)
 
     @bot.message_handler(func=lambda message: True)
     def handle_text_message(message):
@@ -106,9 +228,7 @@ def create_bot(token):
             return
 
         chat_id = message.chat.id
-        spk_id = user_speakers.get(chat_id, 'star04')
-        loc = user_locales.get(chat_id, None)
-        print(f"[Bot] Synthesizing for {chat_id}: '{text[:30]}...' ({spk_id}, loc={loc})", flush=True)
+        cfg = get_config(chat_id)
         
         try:
             bot.send_chat_action(chat_id, 'record_voice')
@@ -118,7 +238,16 @@ def create_bot(token):
         try:
             eng = get_engine()
             temp_wav = f"voice_{chat_id}_{int(time.time()*1000)}.wav"
-            eng.synthesize(text, locale=loc, speaker=spk_id, out_wav=temp_wav)
+            eng.synthesize(
+                text,
+                locale=cfg['locale'],
+                speaker=cfg['speaker'],
+                speed=cfg['speed'],
+                pitch=cfg['pitch'],
+                cf_guidance=cfg['cf_guidance'],
+                temperature=cfg['temperature'],
+                out_wav=temp_wav
+            )
             
             with open(temp_wav, "rb") as audio:
                 try:
@@ -129,7 +258,6 @@ def create_bot(token):
                     
             if os.path.exists(temp_wav):
                 os.remove(temp_wav)
-            print(f"[Bot] Sent voice to {chat_id}", flush=True)
         except Exception as e:
             print(f"[Bot] Error: {e}", flush=True)
             bot.reply_to(message, f"خطأ: {str(e)}")

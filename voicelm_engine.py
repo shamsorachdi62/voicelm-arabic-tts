@@ -3,6 +3,47 @@ import sys
 import re
 import numpy as np
 import scipy.io.wavfile as wavfile
+import scipy.signal as signal
+
+def phase_vocoder(audio, rate, sr=24000):
+    """High-quality time-scale modification (speed change) using phase vocoder."""
+    if abs(rate - 1.0) < 0.01 or len(audio) < 1000:
+        return audio
+    hop = 240
+    nfft = 960
+    f, t, D = signal.stft(audio, fs=sr, nperseg=nfft, noverlap=nfft - hop)
+    time_steps = np.arange(0, D.shape[1], rate)
+    time_steps = time_steps[time_steps < D.shape[1] - 1]
+    if len(time_steps) == 0:
+        return audio
+        
+    stretched_spec = np.zeros((D.shape[0], len(time_steps)), dtype=complex)
+    stretched_spec[:, 0] = D[:, 0]
+    phase_acc = np.angle(D[:, 0])
+    omega = 2 * np.pi * np.arange(D.shape[0]) * hop / nfft
+    
+    for i, step in enumerate(time_steps[1:], 1):
+        prev_idx = int(np.floor(step))
+        next_idx = prev_idx + 1
+        alpha = step - prev_idx
+        
+        mag = (1 - alpha) * np.abs(D[:, prev_idx]) + alpha * np.abs(D[:, next_idx])
+        dphi = np.angle(D[:, next_idx]) - np.angle(D[:, prev_idx]) - omega
+        dphi = dphi - 2 * np.pi * np.round(dphi / (2 * np.pi))
+        phase_acc += omega + dphi
+        stretched_spec[:, i] = mag * np.exp(1j * phase_acc)
+        
+    _, out = signal.istft(stretched_spec, fs=sr, nperseg=nfft, noverlap=nfft - hop)
+    return out
+
+def pitch_shift(audio, semitones, sr=24000):
+    """Pitch shift in semitones (-6 to +6) preserving duration."""
+    if abs(semitones) < 0.05 or len(audio) < 1000:
+        return audio
+    factor = 2.0 ** (semitones / 12.0)
+    stretched = phase_vocoder(audio, factor, sr=sr)
+    return signal.resample(stretched, len(audio))
+
 
 # Cross-platform TFLite interpreter loader
 def get_interpreter(model_path):
@@ -245,7 +286,9 @@ class VoiceLMTTS:
         out_samples.append(state[:240].copy())
         return np.concatenate(out_samples)
 
-    def _synthesize_chunk(self, chunk_text, locale='ar_xa', speaker='star04', max_frames=80, cf_guidance=2.2, temperature=0.4):
+    def _synthesize_chunk(self, chunk_text, locale='ar_xa', speaker='star04', max_frames=80, cf_guidance=2.2, temperature=0.4, seed=None):
+        if seed is not None:
+            np.random.seed(int(seed))
         prompt_floats = self.prompt_store.get(locale=locale, speaker=speaker)
         if prompt_floats is None:
             prompt_floats = np.zeros((1, 54, 128), dtype=np.float32)
@@ -394,9 +437,17 @@ class VoiceLMTTS:
             chunks.append(current.strip())
         return chunks if chunks else [text]
 
-    def synthesize(self, text, locale=None, speaker='star04', out_wav=None, cf_guidance=2.2, temperature=0.4):
+    def synthesize(self, text, locale=None, speaker='star04', speed=1.0, pitch=0.0, cf_guidance=2.2, temperature=0.4, seed=None, volume=1.0, max_frames=80, out_wav=None):
         """
-        Multilingual synthesis. If locale is None, auto-detects from text!
+        Multilingual synthesis with full acoustic and neural parameter control:
+        - locale: Language/dialect code (ar_xa, en_us, fr_fr, etc.) or None for auto-detect
+        - speaker: Voice profile (star02, star04, star05, star08, star11, star12, star13, star16)
+        - speed: Playback tempo rate (0.5 to 2.0, default 1.0)
+        - pitch: Pitch shift in semitones (-6 to +6, default 0.0)
+        - cf_guidance: Classifier-free guidance scale (1.0 to 5.0, default 2.2)
+        - temperature: Sampling temperature (0.1 to 1.0, default 0.4)
+        - seed: Random seed for reproducible intonation
+        - volume: Output volume scaling (0.1 to 1.5, default 1.0)
         """
         if locale is None:
             locale = self.detect_locale(text)
@@ -406,15 +457,34 @@ class VoiceLMTTS:
         silence = np.zeros(int(24000 * 0.15), dtype=np.float32)
 
         for idx, chunk in enumerate(chunks):
-            w = self._synthesize_chunk(chunk, locale=locale, speaker=speaker, cf_guidance=cf_guidance, temperature=temperature)
+            w = self._synthesize_chunk(
+                chunk,
+                locale=locale,
+                speaker=speaker,
+                max_frames=max_frames,
+                cf_guidance=cf_guidance,
+                temperature=temperature,
+                seed=seed
+            )
             waveforms.append(w)
             if idx < len(chunks) - 1:
                 waveforms.append(silence)
 
         waveform = np.concatenate(waveforms)
+
+        # Apply pitch shifting if specified
+        if abs(pitch) >= 0.05:
+            waveform = pitch_shift(waveform, pitch, sr=24000)
+
+        # Apply time-scale modification (speed) if specified
+        if abs(speed - 1.0) >= 0.02:
+            waveform = phase_vocoder(waveform, speed, sr=24000)
+
+        # Apply volume and peak normalization
         max_val = np.abs(waveform).max()
         if max_val > 1e-4:
-            waveform = waveform / max_val * 0.95
+            gain = min(max(volume, 0.1), 1.5)
+            waveform = (waveform / max_val) * gain * 0.95
 
         if out_wav:
             wavfile.write(out_wav, 24000, (waveform * 32767).astype(np.int16))
