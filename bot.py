@@ -244,6 +244,7 @@ def create_bot(token):
                 pitch=cfg['pitch'],
                 cf_guidance=cfg['cf_guidance'],
                 temperature=cfg['temperature'],
+                max_frames=192,
                 out_wav=temp_wav
             )
             

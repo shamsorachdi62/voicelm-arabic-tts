@@ -286,7 +286,7 @@ class VoiceLMTTS:
         out_samples.append(state[:240].copy())
         return np.concatenate(out_samples)
 
-    def _synthesize_chunk(self, chunk_text, locale='ar_xa', speaker='star04', max_frames=80, cf_guidance=2.2, temperature=0.4, seed=None):
+    def _synthesize_chunk(self, chunk_text, locale='ar_xa', speaker='star04', max_frames=192, cf_guidance=2.2, temperature=0.4, seed=None):
         if seed is not None:
             np.random.seed(int(seed))
         prompt_floats = self.prompt_store.get(locale=locale, speaker=speaker)
@@ -387,7 +387,7 @@ class VoiceLMTTS:
             target_emb = self.depth.get_tensor(depth_outs[1]['index'])
             new_ids = self.depth.get_tensor(depth_outs[2]['index'])
 
-            if new_ids < 2:
+            if new_ids < 2 and t >= 3:
                 break
 
             self.quant.set_tensor(quant_inps[0]['index'], ss_tokens.reshape(1, 18))
@@ -412,32 +412,80 @@ class VoiceLMTTS:
         stft_all = np.array(stft_frames_list)
         return self._stream_istft(stft_all)
 
-    def split_into_chunks(self, text, max_bytes=220):
+    def split_into_chunks(self, text, max_bytes=170):
+        """
+        Hierarchical text chunking ensuring every chunk is <= max_bytes (<= 256 byte input limit),
+        splitting first by sentence punctuation, then by clauses, and finally by words.
+        """
         text = self.normalize_text(text)
+        if not text:
+            return []
         if len(text.encode('utf-8')) <= max_bytes:
             return [text]
 
-        delimiters = r'([.،؛؟!\n]+)'
-        parts = re.split(delimiters, text)
-        chunks = []
-        current = ""
-
-        for part in parts:
-            if not part:
+        # Level 1: Sentence boundaries
+        major_delims = r'([.!?؛؟\n]+)'
+        segments = re.split(major_delims, text)
+        
+        rebuilt = []
+        curr = ""
+        for seg in segments:
+            if not seg:
                 continue
-            test = (current + part).strip()
-            if len(test.encode('utf-8')) <= max_bytes:
-                current += part
+            cand = (curr + seg).strip()
+            if len(cand.encode('utf-8')) <= max_bytes:
+                curr = cand
             else:
-                if current.strip():
-                    chunks.append(current.strip())
-                current = part
+                if curr:
+                    rebuilt.append(curr)
+                curr = seg.strip()
+        if curr:
+            rebuilt.append(curr)
 
-        if current.strip():
-            chunks.append(current.strip())
-        return chunks if chunks else [text]
+        # Level 2: Sub-clause boundaries (commas, colons, dashes)
+        final_chunks = []
+        for chunk in rebuilt:
+            if len(chunk.encode('utf-8')) <= max_bytes:
+                final_chunks.append(chunk)
+                continue
+            
+            subparts = re.split(r'([،,:-]+)', chunk)
+            sub_curr = ""
+            for sub in subparts:
+                if not sub:
+                    continue
+                cand = (sub_curr + sub).strip()
+                if len(cand.encode('utf-8')) <= max_bytes:
+                    sub_curr = cand
+                else:
+                    if sub_curr:
+                        final_chunks.append(sub_curr)
+                    sub_curr = sub.strip()
+            if sub_curr:
+                final_chunks.append(sub_curr)
 
-    def synthesize(self, text, locale=None, speaker='star04', speed=1.0, pitch=0.0, cf_guidance=2.2, temperature=0.4, seed=None, volume=1.0, max_frames=80, out_wav=None):
+        # Level 3: Word boundaries (space-separated)
+        safe_chunks = []
+        for chunk in final_chunks:
+            if len(chunk.encode('utf-8')) <= max_bytes:
+                safe_chunks.append(chunk)
+                continue
+            words = chunk.split()
+            w_curr = ""
+            for w in words:
+                cand = (w_curr + " " + w).strip()
+                if len(cand.encode('utf-8')) <= max_bytes:
+                    w_curr = cand
+                else:
+                    if w_curr:
+                        safe_chunks.append(w_curr)
+                    w_curr = w
+            if w_curr:
+                safe_chunks.append(w_curr)
+
+        return safe_chunks if safe_chunks else [text]
+
+    def synthesize(self, text, locale=None, speaker='star04', speed=1.0, pitch=0.0, cf_guidance=2.2, temperature=0.4, seed=None, volume=1.0, max_frames=192, out_wav=None):
         """
         Multilingual synthesis with full acoustic and neural parameter control:
         - locale: Language/dialect code (ar_xa, en_us, fr_fr, etc.) or None for auto-detect
