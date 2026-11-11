@@ -13,7 +13,7 @@ import telebot
 from telebot import types
 from voicelm_engine import VoiceLMTTS, SPEAKERS_INFO
 
-DEFAULT_TOKEN = os.environ.get("BOT_TOKEN", "9256956395:AAGYTGF2vYVMzGafGzKsDLseZh2JLEpfZyM")
+DEFAULT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 POPULAR_LOCALES = {
     'auto': 'تلقائي',
