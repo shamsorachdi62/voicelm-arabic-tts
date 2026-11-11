@@ -240,7 +240,18 @@ class VoiceLMTTS:
                 import soundfile as sf
                 audio, sr = sf.read(audio_source)
             except Exception:
-                sr, audio = wavfile.read(audio_source)
+                try:
+                    import subprocess, tempfile
+                    from scipy.io import wavfile
+                    temp_wav = tempfile.mktemp(suffix=".wav")
+                    subprocess.run(["ffmpeg", "-y", "-i", audio_source, "-ar", "24000", "-ac", "1", temp_wav],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                    sr, audio = wavfile.read(temp_wav)
+                    if os.path.exists(temp_wav):
+                        os.remove(temp_wav)
+                except Exception:
+                    from scipy.io import wavfile
+                    sr, audio = wavfile.read(audio_source)
         elif isinstance(audio_source, tuple):
             sr, audio = audio_source
         else:
