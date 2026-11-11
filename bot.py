@@ -3,6 +3,7 @@
 VoiceLM Multilingual TTS Telegram Bot:
 Ultra-minimal, zero stats, zero emojis, purely functional.
 Supports full parameter control: speed, pitch, guidance, temperature, locale, speaker.
+Supports native Instant Zero-Shot Voice Cloning by sending any audio / voice note!
 """
 
 import os
@@ -31,7 +32,8 @@ POPULAR_LOCALES = {
 }
 
 engine = None
-user_params = {}  # chat_id -> dict
+user_params = {}            # chat_id -> dict
+user_custom_embeddings = {} # chat_id -> np.ndarray [1, T, 128]
 
 DEFAULT_CONFIG = {
     'speaker': 'star04',
@@ -101,7 +103,11 @@ def create_bot(token):
 
     @bot.message_handler(commands=['start', 'help'])
     def handle_start(message):
-        bot.reply_to(message, "أرسل النص لتحويله إلى صوت مباشرة.\nالأوامر: /voice /lang /speed /pitch /guidance /temp /settings /reset")
+        bot.reply_to(
+            message,
+            "أرسل النص لتحويله إلى صوت مباشرة، أو أرسل أي تسجيل صوتي لاستنساخه والتحدث به فوراً.\n"
+            "الأوامر: /voice /lang /speed /pitch /guidance /temp /settings /reset"
+        )
 
     @bot.message_handler(commands=['voice'])
     def handle_voice_cmd(message):
@@ -171,7 +177,7 @@ def create_bot(token):
     def handle_settings_cmd(message):
         cfg = get_config(message.chat.id)
         loc = cfg['locale'] if cfg['locale'] else "تلقائي"
-        spk = cfg['speaker']
+        spk = "مستنسخ مخصص (Cloned)" if cfg['speaker'] == 'cloned' else cfg['speaker']
         msg = (
             f"الصوت: {spk}\n"
             f"اللغة: {loc}\n"
@@ -185,6 +191,7 @@ def create_bot(token):
     @bot.message_handler(commands=['reset'])
     def handle_reset_cmd(message):
         user_params[message.chat.id] = DEFAULT_CONFIG.copy()
+        user_custom_embeddings.pop(message.chat.id, None)
         bot.reply_to(message, "تمت استعادة الإعدادات الافتراضية.")
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith('spk_'))
@@ -192,6 +199,7 @@ def create_bot(token):
         spk_id = call.data.replace('spk_', '')
         if spk_id in SPEAKERS_INFO:
             set_config(call.message.chat.id, 'speaker', spk_id)
+            user_custom_embeddings.pop(call.message.chat.id, None)
             bot.answer_callback_query(call.id, f"تم اختيار {spk_id}")
             bot.edit_message_text(f"تم اختيار: {spk_id}.", chat_id=call.message.chat.id, message_id=call.message.message_id)
 
@@ -219,6 +227,45 @@ def create_bot(token):
         bot.answer_callback_query(call.id, f"الحدة: {val:+.1f}")
         bot.edit_message_text(f"تم ضبط الحدة: {val:+.1f}.", chat_id=call.message.chat.id, message_id=call.message.message_id)
 
+    # Instant Voice Cloning Handler: Receives Voice Note or Audio File
+    @bot.message_handler(content_types=['voice', 'audio', 'document'])
+    def handle_voice_upload(message):
+        chat_id = message.chat.id
+        file_id = None
+        if message.voice:
+            file_id = message.voice.file_id
+        elif message.audio:
+            file_id = message.audio.file_id
+        elif message.document and any(message.document.file_name.lower().endswith(ext) for ext in ['.wav', '.mp3', '.ogg', '.oga', '.m4a']):
+            file_id = message.document.file_id
+
+        if not file_id:
+            bot.reply_to(message, "يرجى إرسال ملف صوتي أو تسجيل صوتي صالح.")
+            return
+
+        try:
+            bot.send_chat_action(chat_id, 'record_voice')
+            file_info = bot.get_file(file_id)
+            downloaded = bot.download_file(file_info.file_path)
+
+            temp_in = f"input_voice_{chat_id}_{int(time.time()*1000)}.oga"
+            with open(temp_in, "wb") as f:
+                f.write(downloaded)
+
+            eng = get_engine()
+            emb = eng.extract_speaker_embedding(temp_in)
+
+            user_custom_embeddings[chat_id] = emb
+            set_config(chat_id, 'speaker', 'cloned')
+
+            if os.path.exists(temp_in):
+                os.remove(temp_in)
+
+            bot.reply_to(message, "تم استنساخ الصوت بنجاح. أرسل أي نص الآن ليتم نطقه بهذا الصوت.")
+        except Exception as e:
+            print(f"[Bot] Clone error: {e}", flush=True)
+            bot.reply_to(message, f"خطأ في استنساخ الصوت: {str(e)}")
+
     @bot.message_handler(func=lambda message: True)
     def handle_text_message(message):
         text = message.text.strip()
@@ -227,12 +274,13 @@ def create_bot(token):
 
         chat_id = message.chat.id
         cfg = get_config(chat_id)
-        
+        spk_emb = user_custom_embeddings.get(chat_id, None) if cfg['speaker'] == 'cloned' else None
+
         try:
             bot.send_chat_action(chat_id, 'record_voice')
         except Exception:
             pass
-            
+
         try:
             eng = get_engine()
             temp_wav = f"voice_{chat_id}_{int(time.time()*1000)}.wav"
@@ -240,6 +288,7 @@ def create_bot(token):
                 text,
                 locale=cfg['locale'],
                 speaker=cfg['speaker'],
+                speaker_embedding=spk_emb,
                 speed=cfg['speed'],
                 pitch=cfg['pitch'],
                 cf_guidance=cfg['cf_guidance'],
@@ -247,14 +296,14 @@ def create_bot(token):
                 max_frames=192,
                 out_wav=temp_wav
             )
-            
+
             with open(temp_wav, "rb") as audio:
                 try:
                     bot.send_voice(chat_id, audio, reply_to_message_id=message.message_id)
                 except Exception:
                     audio.seek(0)
                     bot.send_audio(chat_id, audio, reply_to_message_id=message.message_id)
-                    
+
             if os.path.exists(temp_wav):
                 os.remove(temp_wav)
         except Exception as e:

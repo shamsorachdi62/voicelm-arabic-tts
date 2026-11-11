@@ -199,6 +199,94 @@ class VoiceLMTTS:
         # Load full multilingual prompt store
         pb_path = os.path.join(models_dir, "speaker_prompts.pb")
         self.prompt_store = MultilingualPromptStore(pb_path)
+        
+        # SoundStream audio encoder for voice cloning (lazy loaded)
+        self._soundstream_enc = None
+
+    def get_soundstream_encoder(self):
+        if self._soundstream_enc is None:
+            enc_path = os.path.join(self.models_dir, "soundstream_encoder.tflite")
+            if not os.path.exists(enc_path):
+                raise FileNotFoundError(f"soundstream_encoder.tflite not found at {enc_path}")
+            self._soundstream_enc = get_interpreter(enc_path)
+            self._soundstream_enc.allocate_tensors()
+            
+            inps = self._soundstream_enc.get_input_details()
+            outs = self._soundstream_enc.get_output_details()
+            self._enc_audio_idx = [i['index'] for i in inps if i['name'] == 'input_audio'][0]
+            self._enc_bottleneck_idx = [o['index'] for o in outs if 'bottleneck' in o['name']][0]
+            
+            self._enc_state_pairs = {}
+            for inp in inps:
+                if inp['name'] == 'input_audio':
+                    continue
+                inp_name_core = inp['name'].split('/')[1]
+                for out in outs:
+                    if 'bottleneck' in out['name']:
+                        continue
+                    out_name_core = out['name'].split('/')[1]
+                    if inp_name_core == out_name_core and tuple(inp['shape']) == tuple(out['shape']):
+                        self._enc_state_pairs[inp['index']] = out['index']
+                        break
+        return self._soundstream_enc
+
+    def extract_speaker_embedding(self, audio_source, max_frames=80):
+        """
+        Extracts 128-dimensional speaker embedding from any audio file (wav, oga, mp3, ogg, etc.)
+        or numpy array. Returns numpy array of shape [1, T, 128].
+        """
+        if isinstance(audio_source, str):
+            try:
+                import soundfile as sf
+                audio, sr = sf.read(audio_source)
+            except Exception:
+                sr, audio = wavfile.read(audio_source)
+        elif isinstance(audio_source, tuple):
+            sr, audio = audio_source
+        else:
+            sr, audio = 24000, audio_source
+
+        if audio.ndim > 1:
+            audio = audio[:, 0]
+        if sr != 24000:
+            import scipy.signal as signal
+            audio = signal.resample(audio, int(len(audio) * 24000 / sr))
+        audio = audio.astype(np.float32)
+        max_abs = np.abs(audio).max()
+        if max_abs > 1.0:
+            audio = audio / max_abs
+        elif max_abs > 1e-4:
+            audio = audio / max_abs
+
+        enc = self.get_soundstream_encoder()
+        inps = enc.get_input_details()
+        window = np.hanning(480).astype(np.float32)
+        states = {i['index']: np.zeros(i['shape'], dtype=np.float32) for i in inps if i['name'] != 'input_audio'}
+
+        num_chunks = min(len(audio) // 2400, max_frames)
+        if num_chunks < 5:
+            num_chunks = max(1, len(audio) // 2400)
+
+        vecs = []
+        for c in range(num_chunks):
+            stft_10 = np.zeros((1, 10, 240, 2), dtype=np.float32)
+            for s in range(10):
+                start = c * 2400 + s * 240
+                f = audio[start : start + 480]
+                if len(f) < 480:
+                    f = np.pad(f, (0, 480 - len(f)))
+                spec = np.fft.rfft(f * window, n=480)
+                stft_10[0, s, :, 0] = spec[:240].real
+                stft_10[0, s, :, 1] = spec[:240].imag
+            enc.set_tensor(self._enc_audio_idx, stft_10)
+            for in_idx, s_val in states.items():
+                enc.set_tensor(in_idx, s_val)
+            enc.invoke()
+            vecs.append(enc.get_tensor(self._enc_bottleneck_idx))
+            for in_idx, out_idx in self._enc_state_pairs.items():
+                states[in_idx] = enc.get_tensor(out_idx)
+
+        return np.concatenate(vecs, axis=1)
 
     def detect_locale(self, text):
         """Auto-detects language script and returns matching locale code."""
@@ -286,10 +374,13 @@ class VoiceLMTTS:
         out_samples.append(state[:240].copy())
         return np.concatenate(out_samples)
 
-    def _synthesize_chunk(self, chunk_text, locale='ar_xa', speaker='star04', max_frames=192, cf_guidance=2.2, temperature=0.4, seed=None):
+    def _synthesize_chunk(self, chunk_text, locale='ar_xa', speaker='star04', speaker_embedding=None, max_frames=192, cf_guidance=2.2, temperature=0.4, seed=None):
         if seed is not None:
             np.random.seed(int(seed))
-        prompt_floats = self.prompt_store.get(locale=locale, speaker=speaker)
+        if speaker_embedding is not None:
+            prompt_floats = speaker_embedding
+        else:
+            prompt_floats = self.prompt_store.get(locale=locale, speaker=speaker)
         if prompt_floats is None:
             prompt_floats = np.zeros((1, 54, 128), dtype=np.float32)
 
@@ -485,11 +576,12 @@ class VoiceLMTTS:
 
         return safe_chunks if safe_chunks else [text]
 
-    def synthesize(self, text, locale=None, speaker='star04', speed=1.0, pitch=0.0, cf_guidance=2.2, temperature=0.4, seed=None, volume=1.0, max_frames=192, out_wav=None):
+    def synthesize(self, text, locale=None, speaker='star04', speaker_embedding=None, speed=1.0, pitch=0.0, cf_guidance=2.2, temperature=0.4, seed=None, volume=1.0, max_frames=192, out_wav=None):
         """
         Multilingual synthesis with full acoustic and neural parameter control:
         - locale: Language/dialect code (ar_xa, en_us, fr_fr, etc.) or None for auto-detect
         - speaker: Voice profile (star02, star04, star05, star08, star11, star12, star13, star16)
+        - speaker_embedding: Optional custom cloned speaker embedding [1, T, 128]
         - speed: Playback tempo rate (0.5 to 2.0, default 1.0)
         - pitch: Pitch shift in semitones (-6 to +6, default 0.0)
         - cf_guidance: Classifier-free guidance scale (1.0 to 5.0, default 2.2)
@@ -509,6 +601,7 @@ class VoiceLMTTS:
                 chunk,
                 locale=locale,
                 speaker=speaker,
+                speaker_embedding=speaker_embedding,
                 max_frames=max_frames,
                 cf_guidance=cf_guidance,
                 temperature=temperature,
